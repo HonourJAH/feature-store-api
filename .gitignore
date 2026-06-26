@@ -1,0 +1,8 @@
+feature_store.db
+pytest_cache/
+__pycache__/
+venv/
+.env
+*.pyc
+*.pyo
+.git
