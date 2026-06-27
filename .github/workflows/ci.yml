@@ -1,0 +1,134 @@
+name: Feature Store API CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+
+  # Job 1: Run Tests
+
+  # Redis is mocked with fakeredis and SQLite runs in-memory
+  # no real infrastructure needed, fast and fully isolated.
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt pytest-cov
+
+      - name: Run test suite with coverage
+        run: pytest -v --cov=app --cov-report=term-missing --tb=short
+
+
+  # Job 2: Build & Verify Docker Image
+
+  # Builds the real image, runs real migrations in a fresh container,
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: feature-store-api:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Move Docker cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Start services
+        run: docker compose up -d --build
+
+      # Active health check — retries instead of a fixed sleep
+      - name: Wait for API to be ready
+        run: |
+          for i in {1..30}; do
+            curl -sf http://localhost:8000/health && break
+            echo "Waiting for API... ($i/30)"
+            sleep 2
+          done
+
+      - name: Health check
+        run: curl --fail http://localhost:8000/health
+
+      # Real behavioral verification
+      - name: Create features for a test entity
+        run: |
+          response=$(curl -sf -X POST http://localhost:8000/features/ci_test_user \
+            -H "Content-Type: application/json" \
+            -d '{
+              "total_purchases": 5,
+              "total_spend": 250.0,
+              "avg_order_value": 50.0,
+              "num_logins_7d": 3,
+              "num_logins_30d": 12,
+              "days_since_last_login": 1,
+              "days_since_last_purchase": 4,
+              "account_age_days": 90
+            }')
+          echo "$response"
+          echo "$response" | grep -q '"entity_id":"ci_test_user"' || \
+            (echo "POST did not return expected entity_id" && exit 1)
+
+      - name: Fast lookup from online store
+        run: |
+          response=$(curl -sf http://localhost:8000/features/ci_test_user)
+          echo "$response"
+          echo "$response" | grep -q '"total_purchases":5' || \
+            (echo "GET did not return expected feature values" && exit 1)
+
+      - name: Verify history was recorded in offline store
+        run: |
+          response=$(curl -sf http://localhost:8000/features/ci_test_user/history)
+          echo "$response"
+          echo "$response" | grep -q '"result":1' || \
+            (echo "History does not show expected snapshot count" && exit 1)
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop services
+        run: docker compose down -v
